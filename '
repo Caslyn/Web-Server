@@ -1,0 +1,290 @@
+#include <netinet/in.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h> 
+#include <unistd.h>
+#include <pthread.h>
+
+#define MAX_HEADER_LEN 1000
+#define MAX_INPUT 2056
+#define MAX_THREADS 20
+#define MAX_CONNECTIONS 100
+
+typedef struct headers {
+    char    url[MAX_HEADER_LEN];
+} headers;
+
+typedef struct request {
+    char                contents[MAX_INPUT];
+    struct headers      headers;
+    int                 offset;
+    int                 capacity;
+    int                 in_socket_fd;
+    int                 out_socket_fd;
+} request;
+
+typedef struct thread_pool {
+    pthread_mutex_t thread_lock; // lock so one thread can have exclusive access
+    pthread_cond_t signal; // conditional signal to lock/unlock
+    pthread_t *threads; // thread buffer
+    int *connection_buffer; // connection buffer
+    int cb_head;
+    int cb_tail; // pointer to place in connection buffer
+    int *c_count; // number of connections
+} thread_pool;
+
+struct request *request_init(char *);
+int create_socket(struct request *);
+int bind_socket(struct request *, struct sockaddr_in *);
+
+thread_pool *build_thread_pool(void);
+void init_worker_thread(thread_pool *tpool);
+
+int begin_listening(struct request *req);
+int accept_connection(struct request *req, struct sockaddr_in *address,socklen_t *addrlen, struct thread_pool *tpool);
+
+void serve_request(int connectionfd);
+char *read_socket(int connectionfd);
+char *get_url(char *content_buffer);
+
+int send_the_file(int file, int connectionfd);
+int write_socket(char *url, int connectionfd);
+void send_default(int connectionfd);
+
+void clean_up_req(struct request *);
+void clean_up_tpool(struct thread_pool *tpool);
+
+int main(){
+    int new_socket, i = 0;
+    thread_pool *tpool;
+    struct request *req = calloc(1, sizeof(request));
+    struct sockaddr_in address;
+    socklen_t addrlen;
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(15000);
+
+    if (create_socket(req) < 0) {
+        clean_up_req(req);
+        return 1;
+    }
+
+    if(bind_socket(req, &address) < 0) {
+        clean_up_req(req);
+        return 1;
+    }
+
+    if ((tpool = build_thread_pool()) == NULL){
+        clean_up_req(req);
+        clean_up_tpool(tpool);
+    }
+
+    begin_listening(req);
+    while(1) {
+      if((accept_connection(req, &address, &addrlen, tpool)) < 0) {
+        exit(1);
+      }
+    }
+    clean_up_req(req);
+    clean_up_tpool(tpool);
+    return 0;
+}
+
+thread_pool *build_thread_pool(void) {
+    thread_pool *tpool;
+    int i;
+
+    // allocate memory for threadpool, threads, connections separately
+    tpool = (thread_pool *)malloc(sizeof(thread_pool));
+    tpool->threads = (pthread_t *) malloc(sizeof(pthread_t) * MAX_THREADS);
+    tpool->connection_buffer = (int *) malloc(sizeof(int) * MAX_CONNECTIONS);
+
+    tpool->cb_head = 0;
+    tpool->cb_tail = 0;
+    tpool->c_count = 0;
+
+    pthread_mutex_init(&(tpool->thread_lock), NULL); //initialize mutex to create exclusive access 
+    pthread_cond_init(&(tpool->signal), NULL); // initialize conditional variable
+
+    for (i = 0; i < MAX_THREADS; i++) {
+        // create new thread and send into a waiting state
+        if (pthread_create(&(tpool->threads[i]), NULL, (void *) init_worker_thread, tpool) != 0) {
+            printf("Error Creating Thread");
+            return NULL;
+        }
+    }
+    return tpool;
+}
+
+void init_worker_thread(thread_pool *tpool) {
+    int connection;
+    while (1) {
+
+        while (tpool->c_count == 0) {
+            printf("Thread %p in Wait State\n", pthread_self());
+            pthread_cond_wait(&(tpool->signal), &(tpool->thread_lock)); // release mutex and wait on conditional variable (tpool->signal)
+        }
+        // get first connection in buffer
+        connection = tpool->connection_buffer[tpool->cb_head++];
+
+        if(tpool->cb_head == MAX_THREADS) {
+            tpool->cb_head = 0;
+        }
+
+        tpool->c_count -=1;
+    }
+    // process connection (connection has already been accepted).
+    serve_request(connection);
+
+    pthread_exit(NULL);
+}
+
+void serve_request(int connectionfd) {
+    char *url;
+    printf("Thread %p is Serving Request\n", pthread_self());
+    url = read_socket(connectionfd);
+    write_socket(url, connectionfd);
+}
+
+void clean_up_req(struct request *req) {
+    if (req->in_socket_fd) {
+        close(req->in_socket_fd);
+    }
+    if (req->out_socket_fd) {
+        close(req->out_socket_fd);
+    }
+    free(req);
+}
+
+void clean_up_tpool(struct thread_pool *tpool) {
+    thread_pool *pool = tpool;
+    int i;
+    // Join threads in order to free together
+    for (i = 0; i < MAX_THREADS; i++) {
+        pthread_join(pool->threads[i], NULL);
+    }
+
+    free(pool);
+}
+
+int create_socket(struct request *req){
+    if ((req->in_socket_fd = socket(AF_INET, SOCK_STREAM, 0)) > 0) {
+        printf("The socket was created.\n");
+    } else {
+        printf("Error creating socket\n");
+        return -1;
+    }
+    return 0;
+}
+
+int bind_socket(struct request *req, struct sockaddr_in *address){
+     if (bind(req->in_socket_fd, (struct sockaddr *) address, sizeof(*address)) == 0) {
+        printf("Binding Socket\n");
+    } else {
+        printf("Error Binding Socket\n");
+        return -1;
+    }
+     return 0;
+}
+
+int begin_listening(struct request *req){
+
+    if (listen(req->in_socket_fd, 10) < 0) {
+        perror("server: listen");
+        return -1;
+    }
+
+    return 0;
+}
+
+int accept_connection(struct request *req, struct sockaddr_in *address, socklen_t *addrlen, struct thread_pool *tpool) {
+    int next;
+
+    if ((req->out_socket_fd = accept(req->in_socket_fd, (struct sockaddr *) address, addrlen)) > 0) {
+        printf("The Client is Connected...\n");
+    } else {
+        perror("server: accept");
+        return -1;
+    }
+    next = tpool->cb_tail + 1;
+    if (next == MAX_THREADS) {
+        next = 0;
+     }
+
+     if (*(tpool->c_count) == MAX_CONNECTIONS) {
+          printf("Max Connections Reached\n");
+          return 0;
+     }
+
+    tpool->connection_buffer[tpool->cb_tail] = req->out_socket_fd; // add connection to end of connection buffer
+    tpool->c_count++;
+    tpool->cb_tail = next;
+    pthread_cond_signal(&(tpool->signal)); // signal to threadpool that connection is waiting (unlock mutex) 
+
+    return 0;
+}
+
+char *read_socket(int connectionfd){
+    char *content_buffer, *url;
+    int offset;
+    offset = recv(connectionfd, content_buffer, MAX_INPUT, 0);
+    content_buffer[offset] = '\0';
+    printf("%s", content_buffer);
+    url = get_url(content_buffer);
+    return url;
+}
+
+char *get_url(char *content_buffer) {
+    int i = 0, j = 0;
+    char *url;
+    while (content_buffer[i++] != ' ');
+    i++;
+    while (content_buffer[i] != ' ') {
+       url[j++] = content_buffer[i++];
+    }
+    url[j] = '\0';
+    return url;
+}
+
+int write_socket(char *url, int connectionfd){
+      int file;
+      if ((file = open(url, O_RDONLY)) >= 0) {
+        if (!send_the_file(file, connectionfd)) {
+          return 0;
+        }
+      }
+      send_default(connectionfd);
+      return 0;
+}
+
+int send_the_file(int file, int connectionfd) {
+    off_t offset = 0, size = 150000;
+    printf("Found requested file...\n\n");
+    if (sendfile(file, connectionfd, offset, &size, 0,0) < 0) {
+        printf("Error Sending File");
+        return -1;
+    }
+    close(file);
+    return 0;
+}
+
+void send_default(int connctionfd) {
+    printf("Send default page\n");
+    char status[MAX_HEADER_LEN] = "HTTP/1.1 400 Not Found\n";
+    char message[MAX_HEADER_LEN] = "<html><body><h1>Page doesn't exist</h1></body></html>\n\n";
+    char ctnt_type_hdr[MAX_HEADER_LEN] = "Content-Type: text/html\n\n";
+    char *ctnt_len_hdr = "Content-Length: ";
+    char ctnt_len_val[20];
+    sprintf(ctnt_len_val, "%d\n", (int) strlen(message));
+
+    send(connectionfd, &status, strlen(status), 0);
+    send(connectionfd, &ctnt_len_hdr, strlen(ctnt_len_hdr), 0);
+    send(connectionfd, &ctnt_len_val, strlen(ctnt_len_val), 0);
+    send(connectionfd, &ctnt_type_hdr, strlen(ctnt_type_hdr), 0);
+    send(connectionfd, &message, strlen(message), 0);
+}
