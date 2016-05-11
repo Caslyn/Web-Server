@@ -10,6 +10,7 @@
 #include <pthread.h>
 
 #define MAX_HEADER_LEN 1000
+#define SHORT_HEADER_LEN 50
 #define MAX_CONTENT 2056
 #define MAX_THREADS 10
 #define MAX_CONNECTIONS 100
@@ -25,6 +26,13 @@ typedef struct thread_pool {
     int c_count; // number of connections
 } thread_pool;
 
+typedef struct headers {
+    char method[SHORT_HEADER_LEN];
+    char url[SHORT_HEADER_LEN];
+    char protocol[SHORT_HEADER_LEN];
+
+} headers;
+
 int *create_socket(int *in_socket);
 int bind_socket(int *in_socket, struct sockaddr_in *);
 
@@ -35,12 +43,11 @@ int begin_listening(int *in_socket);
 int accept_connection(int *in_socket, struct sockaddr_in *address, socklen_t *addrlen, struct thread_pool *tpool);
 
 void serve_request(int out_socketfd);
-char *read_socket(int out_socketfd);
-char *get_url(char *content_buffer);
+int read_socket(int out_socketfd, struct headers *req_headers);
+int parse_headers(char *req_content, struct headers *req_headers);
 
 int send_the_file(int file, int out_socketfd);
-int write_socket(int out_socketfd);
-void send_default(int out_socketfd);
+int write_socket(int out_socketfd, struct headers *req_headers);
 
 void clean_up_tpool(struct thread_pool *tpool);
 
@@ -126,9 +133,12 @@ void init_worker_thread(thread_pool *tpool) {
 }
 
 void serve_request(int socketfd) {
+    struct headers *req_headers = (headers *) malloc(sizeof(struct headers));
+
     printf("Thread %p is Serving Request\n", pthread_self());
-    read_socket(socketfd);
-    write_socket(socketfd);
+    read_socket(socketfd, req_headers);
+    write_socket(socketfd, req_headers);
+    free(req_headers);
 }
 
 void clean_up_tpool(struct thread_pool *tpool) {
@@ -199,63 +209,56 @@ int accept_connection(int *in_socket, struct sockaddr_in *address, socklen_t *ad
     return 0;
 }
 
-char *read_socket(int socketfd){
-    int offset, max_input = 2056;
-    char content_buffer[max_input], *url;
-    offset = recv(socketfd, content_buffer, max_input, 0);
-    content_buffer[offset] = '\0';
-    printf("%s", content_buffer);
-    //url = get_url(content_buffer);
-    char *def = "";
-    return def;
-}
+int read_socket(int socketfd, struct headers *req_headers){
+    int offset;
+    char req_content[MAX_CONTENT];
 
-char *get_url(char *content_buffer) {
-    int i = 0, j = 0;
-    char *url;
-    while (content_buffer[i++] != ' ');
-    i++;
-    while (content_buffer[i] != ' ') {
-       url[j++] = content_buffer[i++];
+    if ((offset = recv(socketfd, req_content, MAX_CONTENT, 0)) > 0) {
+      req_content[offset] = '\0';
+      parse_headers(req_content, req_headers); // parse headers, passing in content
+      printf("%s", req_content);
+      return 0;
+    } else {
+        printf("Error Recieving Request");
+        return -1;
     }
-    url[j] = '\0';
-    return url;
 }
 
-int write_socket(int socketfd){
-      /*int file;
-      if ((file = open(url, O_RDONLY)) >= 0) {
+int parse_headers(char *req_content, struct headers *req_headers) {
+    int i;
+
+    for(i = 0; *req_content != ' '; i++) {
+        req_headers->method[i] = *req_content++;
+    }
+    req_headers->method[i] = '\0';
+    req_content = req_content + 2; // skip past space and pre-emptive '/'
+
+    for(i = 0; *req_content != ' '; i++) {
+      req_headers->url[i] = *req_content++;
+    }
+    req_headers->url[i] = '\0';
+    return 0;
+}
+
+int write_socket(int socketfd, struct headers *req_headers){
+      int file;
+      if ((file = open(req_headers->url, O_RDONLY)) >= 0) {
         if (!send_the_file(file, socketfd)) {
           return 0;
         }
-      } */
-      send_default(socketfd);
+      } else {
+        file = open("views/not_found.html", O_RDONLY);
+        send_the_file(file, socketfd);
+      }
       return 0;
 }
 
 int send_the_file(int file, int socketfd) {
     off_t offset = 0, size = 150000;
-    printf("Found requested file...\n\n");
     if (sendfile(file, socketfd, offset, &size, 0,0) < 0) {
         printf("Error Sending File");
         return -1;
     }
     close(file);
     return 0;
-}
-
-void send_default(int socketfd) {
-    printf("Send default page\n");
-    char status[MAX_HEADER_LEN] = "HTTP/1.1 400 Not Found\n";
-    char message[MAX_HEADER_LEN] = "<html><body><h1>Page doesn't exist</h1></body></html>\n\n";
-    char ctnt_type_hdr[MAX_HEADER_LEN] = "Content-Type: text/html\n\n";
-    char *ctnt_len_hdr = "Content-Length: ";
-    char ctnt_len_val[20];
-    sprintf(ctnt_len_val, "%d\n", (int) strlen(message));
-
-    send(socketfd, &status, strlen(status), 0);
-    send(socketfd, &ctnt_len_hdr, strlen(ctnt_len_hdr), 0);
-    send(socketfd, &ctnt_len_val, strlen(ctnt_len_val), 0);
-    send(socketfd, &ctnt_type_hdr, strlen(ctnt_type_hdr), 0);
-    send(socketfd, &message, strlen(message), 0);
 }
